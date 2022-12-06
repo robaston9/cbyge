@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/robaston9/cbyge"
 	"github.com/unixpickle/essentials"
 )
@@ -37,8 +38,15 @@ type HealthStatus struct {
 	Status string
 }
 
+type MQTTSetState struct {
+	State      string `json:"state"`
+	Brightness int    `json:"brightness"`
+	ColorTemp  int    `json:"color_temp"`
+}
+
 func main() {
 	s := &Server{}
+
 	var addr string
 	var assets string
 	flag.StringVar(&assets, "assets", "assets", "assets directory")
@@ -49,6 +57,12 @@ func main() {
 	flag.StringVar(&s.WebPassword, "web-password", "",
 		"password for basic auth, if different than the account password")
 	flag.BoolVar(&s.NoAuth, "no-auth", false, "do not require any password")
+	flag.BoolVar(&s.UseMQTT, "use-mqtt", false, "integrate with mqtt")
+	flag.StringVar(&s.MQTTAddress, "mqtt-address", "",
+		"MQTT broker address (hostname or ip address)")
+	flag.IntVar(&s.MQTTPort, "mqtt-port", 1883, "MQTT broker port")
+	flag.StringVar(&s.MQTTUsername, "mqtt-username", "", "MQTT broker username")
+	flag.StringVar(&s.MQTTPassword, "mqtt-password", "", "MQTT broker password")
 	flag.Parse()
 
 	if s.SessionInfo == "" && (s.Email == "" || s.Password == "") {
@@ -57,6 +71,14 @@ func main() {
 
 	if s.WebPassword == "" {
 		s.WebPassword = s.Password
+	}
+
+	if s.UseMQTT && s.MQTTAddress == "" {
+		essentials.Die("Must provide -mqtt-address when using mqtt")
+	}
+
+	if s.UseMQTT {
+		s.SetupMQTT()
 	}
 
 	http.Handle("/", s.Auth(s.Redirect2FA(http.FileServer(http.Dir(assets)).ServeHTTP).ServeHTTP))
@@ -81,12 +103,97 @@ type Server struct {
 	WebPassword string
 	NoAuth      bool
 
+	UseMQTT      bool
+	MQTTUsername string
+	MQTTPassword string
+	MQTTAddress  string
+	MQTTPort     int
+
 	devicesLock sync.Mutex
 	devices     []*cbyge.ControllerDevice
 
 	controllerLock sync.Mutex
 	sessionInfo    *cbyge.SessionInfo
 	controller     *cbyge.Controller
+
+	mqttClient mqtt.Client
+}
+
+func (s *Server) SetupMQTT() {
+	var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
+		fmt.Printf("MQTT Message Received: %s from topic: %s\n", msg.Payload(), msg.Topic())
+		slugs := strings.Split(msg.Topic(), "/")
+		scope := slugs[1]
+		if scope == "gecync" {
+			action := slugs[2]
+			id := slugs[3]
+			d, _ := s.getDevice(id)
+			var cmd MQTTSetState
+			json.Unmarshal([]byte(msg.Payload()), &cmd)
+			switch {
+			case action == "set-state" && cmd.ColorTemp > 0:
+				bottom := 153
+				top := 500
+				spread := top - bottom
+				adjustedInput := cmd.ColorTemp - bottom
+				reverse := (adjustedInput * 100) / spread
+				uncurvedTone := 100 - reverse
+				// apply a simple quadradic curve to the value
+				// otherwise the light is too blue through the range
+				fv := float32(uncurvedTone) / 100
+				tone := int((fv * fv) * 100)
+				s.controller.SetDeviceCT(d, tone)
+				s.MQTTPublishColorTemp(id, uncurvedTone)
+			case action == "set-state" && cmd.Brightness > 0:
+				s.controller.SetDeviceLum(d, cmd.Brightness)
+				s.MQTTPublishBrightness(id, cmd.Brightness)
+			case action == "set-state":
+				s.controller.SetDeviceStatus(d, cmd.State == "ON")
+				s.MQTTPublishStatus(id, cmd.State)
+			}
+		}
+		if scope == "status" {
+			if string(msg.Payload()) == "online" {
+				s.MQTTPublishDeviceConfigAll()
+			}
+		}
+	}
+
+	var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
+		fmt.Println("MQTT Connected")
+	}
+
+	var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
+		fmt.Printf("MQTT Connect lost: %v", err)
+	}
+
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(fmt.Sprintf("tcp://%s:%d", s.MQTTAddress, s.MQTTPort))
+	opts.SetClientID("cbyge")
+	opts.SetUsername(s.MQTTUsername)
+	opts.SetPassword(s.MQTTPassword)
+	opts.SetDefaultPublishHandler(messagePubHandler)
+	opts.OnConnect = connectHandler
+	opts.OnConnectionLost = connectLostHandler
+	s.mqttClient = mqtt.NewClient(opts)
+	if token := s.mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		panic(token.Error())
+	}
+
+	topic1 := "homeassistant/gecync/#"
+	token1 := s.mqttClient.Subscribe(topic1, 1, nil)
+	token1.Wait()
+	fmt.Printf("Subscribed to topic %s\n", topic1)
+
+	topic2 := "homeassistant/status"
+	token2 := s.mqttClient.Subscribe(topic2, 1, nil)
+	token2.Wait()
+	fmt.Printf("Subscribed to topic %s\n", topic2)
+
+	if s.SessionInfo != "" {
+		fmt.Println("Configuring MQTT ...")
+		s.MQTTPublishDeviceConfigAll()
+	}
 }
 
 func (s *Server) HandleHealth() http.Handler {
@@ -160,6 +267,9 @@ func (s *Server) Handle2FAStage2(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/2fa.html?error="+url.QueryEscape(err.Error()), http.StatusTemporaryRedirect)
 	} else {
 		s.controllerLock.Lock()
+		// log the sesion info
+		data, _ := json.Marshal(session)
+		fmt.Println(string(data))
 		s.sessionInfo = session
 		s.controllerLock.Unlock()
 		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
@@ -167,7 +277,6 @@ func (s *Server) Handle2FAStage2(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleDevices(w http.ResponseWriter, r *http.Request) {
-
 	var devs []*cbyge.ControllerDevice
 	var err error
 	if r.FormValue("refresh") != "" {
@@ -201,8 +310,115 @@ func (s *Server) HandleDevices(w http.ResponseWriter, r *http.Request) {
 			"name":   d.Name(),
 			"status": encodeStatus(statuses[i]),
 		})
+
+		if s.UseMQTT {
+			id := d.DeviceID()
+			name := d.Name()
+			s.MQTTPublishDeviceConfig(id, name)
+
+			// Set the status through MQTT
+			// Set the status through MQTT
+			var status string
+			if statuses[i].IsOn {
+				status = "ON"
+			} else {
+				status = "OFF"
+			}
+			s.MQTTPublishStatus(id, status)
+			s.MQTTPublishBrightness(id, int(statuses[i].Brightness))
+			s.MQTTPublishColorTemp(id, int(statuses[i].ColorTone))
+		}
 	}
 	s.serveObject(w, http.StatusOK, data)
+}
+
+func (s *Server) MQTTPublishDeviceConfigAll() {
+	devs, _ := s.getDevices()
+	ctrl, _ := s.getController()
+	statuses, _ := ctrl.DeviceStatuses(devs)
+	for i, d := range devs {
+		id := d.DeviceID()
+		name := d.Name()
+		s.MQTTPublishDeviceConfig(id, name)
+
+		// Set the status through MQTT
+		// Set the status through MQTT
+		var status string
+		if statuses[i].IsOn {
+			status = "ON"
+		} else {
+			status = "OFF"
+		}
+		s.MQTTPublishStatus(id, status)
+		s.MQTTPublishBrightness(id, int(statuses[i].Brightness))
+		s.MQTTPublishColorTemp(id, int(statuses[i].ColorTone))
+	}
+}
+
+func (s *Server) MQTTPublishDeviceConfig(id string, name string) {
+	topic := "homeassistant/light/gecync/" + id + "/config"
+
+	var suppColorModes [1]string
+	suppColorModes[0] = "color_temp"
+	// suppColorModes[1] = "rgb"
+
+	var identifiers [2]string
+	identifiers[0] = id
+	identifiers[1] = name
+
+	device := map[string]interface{}{
+		"identifiers":  identifiers,
+		"name":         name,
+		"model":        "GE Cync Direct Connect Light Bulb",
+		"manufacturer": "GE",
+		"sw_version":   "4.XX",
+	}
+
+	mqttPayload := map[string]interface{}{
+		"name":                     name,
+		"unique_id":                id,
+		"schema":                   "json",
+		"state_topic":              "homeassistant/gecync/state/" + id,
+		"command_topic":            "homeassistant/gecync/set-state/" + id,
+		"brightness_state_topic":   "homeassistant/gecync/brightness/" + id,
+		"brightness_command_topic": "homeassistant/gecync/set-brightness/" + id,
+		"color_temp_state_topic":   "homeassistant/gecync/color-temp/" + id,
+		"color_temp_command_topic": "homeassistant/gecync/set-color-temp/" + id,
+		"brightness":               true,
+		"brightness_scale":         100,
+		"color_mode":               true,
+		"supported_color_modes":    suppColorModes,
+		"device":                   device,
+	}
+
+	data, _ := json.Marshal(mqttPayload)
+	token := s.mqttClient.Publish(topic, 0, false, data)
+	token.Wait()
+}
+
+func (s *Server) MQTTPublishStatus(id string, status string) {
+	state := map[string]interface{}{"state": status}
+	topic := "homeassistant/gecync/state/" + id
+	data, _ := json.Marshal(state)
+	token := s.mqttClient.Publish(topic, 0, false, data)
+	token.Wait()
+}
+
+func (s *Server) MQTTPublishBrightness(id string, brightness int) {
+	topic := "homeassistant/gecync/brightness/" + id
+	data, _ := json.Marshal(brightness)
+	token := s.mqttClient.Publish(topic, 0, false, data)
+	token.Wait()
+}
+
+func (s *Server) MQTTPublishColorTemp(id string, colorTempPercent int) {
+	topic := "homeassistant/gecync/color-temp/" + id
+	top := 500
+	bottom := 153
+	colorTemp := (colorTempPercent * (top - bottom) / 100) + bottom
+	data, _ := json.Marshal(colorTemp)
+	token := s.mqttClient.Publish(topic, 0, false, data)
+	token.Wait()
 }
 
 func (s *Server) HandleDeviceStatus(w http.ResponseWriter, r *http.Request) {
